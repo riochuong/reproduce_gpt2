@@ -276,6 +276,7 @@ model = GPT(GPTConfig)
 print(f"Loaded GPT-2 !!! YAYYAYAYAY")
 model.eval()
 model.to(device)
+model = torch.compile(model)
 
 # generate prefix tokens 
 import tiktoken
@@ -306,7 +307,7 @@ enc = tiktoken.get_encoding("gpt2")
 # training loop
 # optimizer: AdamW is the bug fixes of Adam per doc from Kaparthy
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-B, T = 4, 1024    # keep this small for debugging
+B, T = 24, 1024    # keep this small for debugging
 data_loader = DataLoaderLite(B, T)
 # not sure if it's available on my old gpu --> so we wont get 8x speedup
 torch.set_float32_matmul_precision('high')
@@ -315,7 +316,9 @@ for i in range(100):
     t0 = time.monotonic() 
     x, y = data_loader.next_batch()
     optimizer.zero_grad()
-    _, loss = model(x, y) 
+    # train with bfloat16 on some parts of the calculations 
+    with torch.autocast(device_type=device , dtype=torch.bfloat16):
+        _, loss = model(x, y) 
     loss.backward()
     optimizer.step()
     # wait for gpu to execute all kernels/works before getting the time
