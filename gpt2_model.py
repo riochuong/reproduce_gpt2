@@ -38,6 +38,9 @@ class CausalSelfAttention(nn.Module):
        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
        # output projection 
        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+       # this to control the growth of weights in residual stream   
+       self.c_proj.NANO_GPT_SCALE_INIT = 1.0 
+
        # regularization 
        self.n_head = config.n_head
        self.n_embd = config.n_embd
@@ -51,7 +54,7 @@ class CausalSelfAttention(nn.Module):
        # nh is "number of heads", hs is "head size", and C (number of channels) = nh * hs
        # e.g: in GPT-2 (124M) n_head=12, hs=64 so nh*hs=C=768 channels in the Transformer
        qkv = self.c_attn(x)
-       q, k, v = qkv.split(self.n_emb, dim=2)
+       q, k, v = qkv.split(self.n_embd, dim=2)
        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
@@ -125,8 +128,31 @@ class GPT(nn.Module):
         #language model head to project from embedding space back to vocab 
         # GPT also use no bias 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+        # weight sharing scheme -- works better and save a ton of parameters also 
+        # what about the shape here 
+        self.transformer.wte.weight = self.lm_head.weight
+
+        # init params
+        # apply will call self._init_weights on all of module that is part of GPT
+        self.apply(self._init_weights)
     
-    def forward(self, idx):
+    def _init_weights(self, module):
+        # this is to mimic how gpt2 model from openai initialized weight
+        # std=0.02 is in the vincinity of Xavier initialization 
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, 'NANO_GPT_SCALE_INIT'):
+                # we have 2 residual stream here one to attention and one to mlp
+                # so we are scaling down the weights
+                std *= (2 * self.config.n_layer) ** -0.5  
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+    
+    def forward(self, idx, targets=None):
         # idx is of shape (B, T) --> T is the index of embeddings that is used for looking up
         B, T = idx.size()
 
@@ -141,7 +167,13 @@ class GPT(nn.Module):
         # forward the final layernorm and the classifier
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
-        return logits
+        loss = None
+        if targets is not None:
+            # need to flatten 3-dim x tensors into 2-dim (input) and 1-dim targets
+            # x: (B, T, vocab_size) -> (B*T, vocab_size)
+            # y: (B, T) ->  (B*T)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+        return logits, loss
     
     @classmethod
     def from_pretrained(cls, model_type: str):
@@ -196,11 +228,151 @@ class GPT(nn.Module):
         return model
 
 # -------------------------------------------------------------------------------------------
+class DataLoaderLite:
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
+    
+        with open("input.txt", 'r') as f:
+            text = f.read()
+        enc = tiktoken.get_encoding('gpt2')
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens)
+        print(f"loaded {len(self.tokens)} tokens")
+        print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
 
-model = GPT.from_pretrained('gpt2')
+        # state
+        self.current_position = 0
+    
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position:self.current_position + (B*T) +1]
+        buf = buf.to(device)
+        x = buf[:-1].view(B, T) # inputs
+        y = buf[1:].view(B, T) # targets
+        # update current position
+        self.current_position += (B*T)
+        # if loading next batch would be out of bounds then we reset
+        # need to check with B*T+1 to make sure every batch has correct
+        # number of inputs vs targets
+        if self.current_position + (B*T+1) > len(self.tokens):
+            self.current_position = 0
+        return x, y 
+
+# attempt to auto detect the device
+device = "cpu"
+if torch.cuda.is_available():
+    device = "cuda"
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    device = "mps"
+print(f"Using device: {device} ")
+
+num_return_sequences = 5
+max_length = 30
+
+#model = GPT.from_pretrained('gpt2')
+# switch to default random model
+model = GPT(GPTConfig)
 print(f"Loaded GPT-2 !!! YAYYAYAYAY")
+model.eval()
+model.to(device)
+
+# generate prefix tokens 
+import tiktoken
+enc = tiktoken.get_encoding("gpt2")
+# tokens = enc.encode("Hello, I'm a language model")
+# tokens = torch.tensor(tokens, dtype=torch.long) # (8, )
+# tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
+
+# get databatch
+
+# with open("input.txt", 'r') as f:
+#     text = f.read()
+# text = text[:1000]
+# tokens = enc.encode(text)
+# buf = torch.tensor(tokens[:B*T + 1])
+# x = buf[:-1].view(B, T)
+# y = buf[1:].view(B, T)
+# x = x.to(device)
+# y = y.to(device)
+
+#logits, loss = model(x, y)
+#print("logits_shape", logits.shape)
+# checking network intialization randomly => expect
+# each tokens will get roughly 1/502257 => expected loss 
+# -ln(1/502257) = 10.824 
+#print("losss:", loss.item())
+
+# training loop
+# optimizer: AdamW is the bug fixes of Adam per doc from Kaparthy
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+B, T = 4, 1024    # keep this small for debugging
+data_loader = DataLoaderLite(B, T)
+# not sure if it's available on my old gpu --> so we wont get 8x speedup
+torch.set_float32_matmul_precision('high')
+import time
+for i in range(100):
+    t0 = time.monotonic() 
+    x, y = data_loader.next_batch()
+    optimizer.zero_grad()
+    _, loss = model(x, y) 
+    loss.backward()
+    optimizer.step()
+    # wait for gpu to execute all kernels/works before getting the time
+    torch.cuda.synchronize()
+    t1 = time.monotonic()
+    tokens_per_sec = (data_loader.B * data_loader.T) / (t1 - t0)
+    #print(f"dt: {(t1 - t0)*1000}ms")
+    # we want to see that we can crush this little batch 
+    # step 41, loss: 0.0025385613553225994
+    # step 42, loss: 0.0024354925844818354
+    # step 43, loss: 0.002342457417398691
+    # step 44, loss: 0.002258246298879385
+    # step 45, loss: 0.002181940246373415
+    # step 46, loss: 0.0021126489154994488
+    # step 47, loss: 0.0020495580974966288
+    # step 48, loss: 0.001992021454498172
+    # step 49, loss: 0.0019393289694562554
+    #if (i % 10) == 0:
+    print(f"step {i}, loss: {loss.item()} dt: {(t1 - t0)*1000}ms tok/sec: {tokens_per_sec}")
+
+import sys; sys.exit(0)
 
 
+
+# generate new tokens now
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
+while x.size(1) < max_length:
+    # forward the model to get the logits
+    with torch.no_grad():
+        logits = model(x) # (B, T, vocab_size)
+        # take the logits at the last position only
+        # (a little bit inefficient but correct)
+        logits = logits[:, -1, :] # (B, vocab_size)
+        # get probabilities
+        probs = F.softmax(logits, dim=-1)
+        # do top-k sampling of 50 (default value from huggingface pipeline)
+        # this will prevent sampling of low probabilities tokens
+        # and keeps the model on the right track 
+        # topk_probs here becomes (5, 50) and 
+        # topk_indices is (5, 50)
+        topk_probs, tok_indices = torch.topk(probs, 50, dim=-1)
+        # select token from the top-k probabilities
+        ix = torch.multinomial(topk_probs, num_samples=1) #(B, 1)
+        # gather the corresponding indices
+        xcol = torch.gather(tok_indices, dim=-1, index=ix)
+        # append to the sequence
+        x = torch.cat((x, xcol), dim=1)
+
+# print the generated text 
+for i in range(num_return_sequences):
+    tokens = x[i, :max_length].tolist()
+    decoded = enc.decode(tokens)
+    print(">", decoded)
+
+
+ 
 
 
 
