@@ -3,8 +3,13 @@ from dataclasses import dataclass
 import torch.nn as nn
 from torch.nn import functional as F
 import math
+import inspect
 
 # ------------------------------------------------------------
+
+
+
+
 
 @dataclass
 class GPTConfig:
@@ -59,10 +64,14 @@ class CausalSelfAttention(nn.Module):
        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
        # attention (metrializes the large (T, T) matrix for all the queries and keys)
-       att = (q @ k.transpose(-2, -1)) * (1.0/math.sqrt(k.size(-1)))
-       att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
-       att = F.softmax(att, dim=-1)
-       y = att @ v
+    #    att = (q @ k.transpose(-2, -1)) * (1.0/math.sqrt(k.size(-1)))
+    #    att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+    #    att = F.softmax(att, dim=-1)
+    #    y = att @ v
+       # FLASH ATTENTION -- (torch.compile cannot find these to optimize just yet)
+       y = F.scaled_dot_product_attention(q, k, v, is_causual=True)
+
+
        # make tensor layout in contiguous memory ??? 
        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side-by-side
        # output projection
@@ -137,6 +146,31 @@ class GPT(nn.Module):
         # apply will call self._init_weights on all of module that is part of GPT
         self.apply(self._init_weights)
     
+    def configure_optimizers(self, weight_decay, learning_rate, device):
+        # separate into groups that should have weight_decay and should not have weight_decay
+        # mostly decay weight that participate in matmul and embeddings
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+
+        # create optim groups, any parameters that is 2D will be weight decay otherwise NO
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0},
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)} with {num_decay_params:,}")
+        print(f"num nodecayed parameter tensors: {len(nodecay_params)} with {num_nodecay_params:,}")
+
+        # Create AdamW optimizer 
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and 'cuda' in device
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+        return optimizer
+
+    
     def _init_weights(self, module):
         # this is to mimic how gpt2 model from openai initialized weight
         # std=0.02 is in the vincinity of Xavier initialization 
@@ -190,7 +224,7 @@ class GPT(nn.Module):
                 'gpt2-xl':          dict(n_layer=12, n_head=12, n_embd=768), # 124M params
         }[model_type]
 
-        config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
+        config_args['vocab_size'] = 50304 # 50304 better numbrer UGly number 50257 # always 50257 for GPT model checkpoints
         config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
 
         # create a from-scratch initialized minGPT model
@@ -247,7 +281,7 @@ class DataLoaderLite:
     def next_batch(self):
         B, T = self.B, self.T
         buf = self.tokens[self.current_position:self.current_position + (B*T) +1]
-        buf = buf.to(device)
+        #buf = buf.to(device)
         x = buf[:-1].view(B, T) # inputs
         y = buf[1:].view(B, T) # targets
         # update current position
@@ -304,27 +338,77 @@ enc = tiktoken.get_encoding("gpt2")
 # -ln(1/502257) = 10.824 
 #print("losss:", loss.item())
 
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_steps = 10
+max_steps = 50
+# learning rate with cosine decay ratio
+# TODO: steps through in ipynb to gain some intuition for this  function  
+def get_lr(it):
+    # 1) linear warmup for warmup_iters steps
+    if it < warmup_steps:
+        return max_lr * (it + 1) / warmup_steps
+    # 2) if it > lr_decay_iters, return min learning rate
+    if it > max_steps:
+        return min_lr
+    # 3) in between, use cosine decay down to min learning rate
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return min_lr + coeff * (max_lr - min_lr)
+
+
+
+# from GPT3 paper the Batchsize is 0.5M 
+# in order to respect it with small GPU 
+# we need to implement gradient accummulation step
+total_batch_size = 524288 # 2**19, ~0.5M nice power of 2 number 
+B = 16 # microbatch size 
+T = 1024 # sequence length
+assert total_batch_size % (B * T) == 0 , "make sure total_batch_size is divisible by B * T"
+grad_accum_steps = total_batch_size // (B * T)
+print(f"total desired batch size: {total_batch_size}")
+print(f"=> caclculated gradient accumulation steps: {grad_accum_steps}")
+
+
 # training loop
 # optimizer: AdamW is the bug fixes of Adam per doc from Kaparthy
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-B, T = 24, 1024    # keep this small for debugging
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
 data_loader = DataLoaderLite(B, T)
 # not sure if it's available on my old gpu --> so we wont get 8x speedup
 torch.set_float32_matmul_precision('high')
 import time
-for i in range(100):
+for step in range(max_steps):
     t0 = time.monotonic() 
-    x, y = data_loader.next_batch()
     optimizer.zero_grad()
-    # train with bfloat16 on some parts of the calculations 
-    with torch.autocast(device_type=device , dtype=torch.bfloat16):
-        _, loss = model(x, y) 
-    loss.backward()
+    loss_accum = 0.0
+    for micro_step in range(grad_accum_steps):
+        x, y = data_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        # train with bfloat16 on some parts of the calculations 
+        with torch.autocast(device_type=device , dtype=torch.bfloat16):
+            _, loss = model(x, y) 
+        # keep deposit gradient for each of the batch here 
+        # the F.crossentropy loss using the "reduction" by "mean" to calculate the loss 
+        # therefore, we need to add the mean factor here. Need to recover the original 
+        # normalizer
+        loss = loss / grad_accum_steps
+        loss_accum += loss.detach()
+        loss.backward()
+    # follow GPT3 paper to clip the gradient to prevent shocking the model learning process with shooting gradient
+    norm = torch.nn.utils.clip_grad_norm_(parameters=model.parameters(), max_norm=1.0)
+    # determine and set learning rate 
+    lr = get_lr(step)
+    # pytorch has the notion of group params so we must set the lr this way
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
     optimizer.step()
     # wait for gpu to execute all kernels/works before getting the time
     torch.cuda.synchronize()
     t1 = time.monotonic()
-    tokens_per_sec = (data_loader.B * data_loader.T) / (t1 - t0)
+    dt = t1 - t0
+    token_processed = data_loader.B * data_loader.T * grad_accum_steps
+    tokens_per_sec = token_processed / dt
     #print(f"dt: {(t1 - t0)*1000}ms")
     # we want to see that we can crush this little batch 
     # step 41, loss: 0.0025385613553225994
@@ -337,12 +421,12 @@ for i in range(100):
     # step 48, loss: 0.001992021454498172
     # step 49, loss: 0.0019393289694562554
     #if (i % 10) == 0:
-    print(f"step {i}, loss: {loss.item()} dt: {(t1 - t0)*1000}ms tok/sec: {tokens_per_sec}")
+    print(f"step {step}, loss: {loss_accum.item():.6f} | norm: {norm:.4f} | dt: {dt*1000}ms | tok/sec: {tokens_per_sec}")
 
 import sys; sys.exit(0)
 
 
-
+# ==================================  SAMPLING FROM TRAINED MODEL ====================================
 # generate new tokens now
 torch.manual_seed(42)
 torch.cuda.manual_seed(42)
