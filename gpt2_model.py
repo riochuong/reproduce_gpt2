@@ -4,6 +4,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 import math
 import inspect
+import numpy as np
 
 # ------------------------------------------------------------
 
@@ -262,21 +263,35 @@ class GPT(nn.Module):
         return model
 
 # -------------------------------------------------------------------------------------------
+def load_tokens(filename):
+    npt = np.load(filename)
+    ptt = torch.tensor(npt, dtype=torch.long)
+    return ptt
+
 class DataLoaderLite:
-    def __init__(self, B, T):
+    def __init__(self, B, T, process_rank, num_processes, split):
         self.B = B
         self.T = T
-    
-        with open("input.txt", 'r') as f:
-            text = f.read()
-        enc = tiktoken.get_encoding('gpt2')
-        tokens = enc.encode(text)
-        self.tokens = torch.tensor(tokens)
-        print(f"loaded {len(self.tokens)} tokens")
-        print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+        assert split in {'train', 'val'}
+
+        # get the shard filenames
+        data_root = "edu_fineweb10B"
+        shards = os.listdir(data_root)
+        shards = [s for s in shards if split in s]
+        shards = sorted(shards)
+        shards = [os.path.join(data_root, s) for s in shards]
+        self.shards = shards
+
+        assert len(shards) > 0, f"no shards found for split {split}"
+        if master_process:
+            print(f"found {len(shards)} shards for split {split}")
 
         # state
-        self.current_position = 0
+        self.current_shard = 0
+        self.tokens = load_tokens(self.shards[self.current_shard])
+        self.current_position = B * T * self.process_rank
     
     def next_batch(self):
         B, T = self.B, self.T
@@ -285,63 +300,21 @@ class DataLoaderLite:
         x = buf[:-1].view(B, T) # inputs
         y = buf[1:].view(B, T) # targets
         # update current position
-        self.current_position += (B*T)
+        self.current_position += B * T * self.num_processes
         # if loading next batch would be out of bounds then we reset
         # need to check with B*T+1 to make sure every batch has correct
         # number of inputs vs targets
-        if self.current_position + (B*T+1) > len(self.tokens):
-            self.current_position = 0
+        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+            self.current_shard = (self.current_shard + 1) % len(self.shards)
+            self.tokens = load_tokens(self.shards[self.current_shard])
+            self.current_position = B * T * self.process_rank
         return x, y 
 
-# attempt to auto detect the device
-device = "cpu"
-if torch.cuda.is_available():
-    device = "cuda"
-elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    device = "mps"
-print(f"Using device: {device} ")
-
-num_return_sequences = 5
-max_length = 30
-
-#model = GPT.from_pretrained('gpt2')
-# switch to default random model
-model = GPT(GPTConfig)
-print(f"Loaded GPT-2 !!! YAYYAYAYAY")
-model.eval()
-model.to(device)
-model = torch.compile(model)
-
-# generate prefix tokens 
-import tiktoken
-enc = tiktoken.get_encoding("gpt2")
-# tokens = enc.encode("Hello, I'm a language model")
-# tokens = torch.tensor(tokens, dtype=torch.long) # (8, )
-# tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
-
-# get databatch
-
-# with open("input.txt", 'r') as f:
-#     text = f.read()
-# text = text[:1000]
-# tokens = enc.encode(text)
-# buf = torch.tensor(tokens[:B*T + 1])
-# x = buf[:-1].view(B, T)
-# y = buf[1:].view(B, T)
-# x = x.to(device)
-# y = y.to(device)
-
-#logits, loss = model(x, y)
-#print("logits_shape", logits.shape)
-# checking network intialization randomly => expect
-# each tokens will get roughly 1/502257 => expected loss 
-# -ln(1/502257) = 10.824 
-#print("losss:", loss.item())
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = 10
-max_steps = 50
+warmup_steps = 715 # gpt papers mentions it warms up with 375e6 tokens / 2^19 (which is the batch_size) =  ~715 steps
+max_steps = 19073 # we have about 10^9 tokens and 10^9 / 2^19 = ~19073
 # learning rate with cosine decay ratio
 # TODO: steps through in ipynb to gain some intuition for this  function  
 def get_lr(it):
@@ -359,6 +332,45 @@ def get_lr(it):
 
 
 
+# ============= IMPLEMENT DISTRIBUTED DATA PARALLEL TO RUN ON MULTIPLE GPUS ==============
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
+import os
+# torchrun command sets the env variables RANK, LOCAL_RANK, and WORDL_SIZE
+ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run ??? a hacky way to check if it's a ddp run
+if ddp:
+    # use of DDP atm demands CUDA, we set the device appropriately according to rank
+    assert torch.cuda.is_available(), "DDP might only support CUDA"
+    init_process_group(backend='nccl')
+    # important and unique for each GPU so we can use it to make sure they are not running on the same data # setup code
+    ddp_rank = int(os.environ['RANK'])
+    # this is used for multinode settings. it is the rank of the GPU in the single node 
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    # this is number of GPU 
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    device = f"cuda:{ddp_local_rank}"
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0 # this process will do logging, checkpointing
+
+else:
+    # vanilla, non-DDP run 
+    ddp_rank = 0
+    ddp_local_rank= 0
+    ddp_world_size = 1
+    master_process = True
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+    print(f"using device: {device}")
+
+# NOTES: 
+# imagine there are 8 GPUS are running at the same time so we need to adjust BATCH, SIZE
+# =========================================================================================
+
+
 # from GPT3 paper the Batchsize is 0.5M 
 # in order to respect it with small GPU 
 # we need to implement gradient accummulation step
@@ -366,15 +378,41 @@ total_batch_size = 524288 # 2**19, ~0.5M nice power of 2 number
 B = 16 # microbatch size 
 T = 1024 # sequence length
 assert total_batch_size % (B * T) == 0 , "make sure total_batch_size is divisible by B * T"
-grad_accum_steps = total_batch_size // (B * T)
-print(f"total desired batch size: {total_batch_size}")
-print(f"=> caclculated gradient accumulation steps: {grad_accum_steps}")
+grad_accum_steps = total_batch_size // (B * T * ddp_world_size) # each process will do B*T but we have ddp_world_size of GPUS
+if master_process:
+    print(f"total desired batch size: {total_batch_size}")
+    print(f"=> caclculated gradient accumulation steps: {grad_accum_steps}")
 
+
+# attempt to auto detect the device
+device = "cpu"
+if torch.cuda.is_available():
+    device = "cuda"
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    device = "mps"
+print(f"Using device: {device} ")
+
+num_return_sequences = 5
+max_length = 30
+
+# switch to default random model
+model = GPT(GPTConfig)
+print(f"Loaded GPT-2 !!! YAYYAYAYAY")
+model.eval()
+model.to(device)
+model = torch.compile(model)
+if ddp:
+    # in the forward pass, it will be identical as single GPU
+    # in the backward pass, when backward pass is complete 
+    # DDP does an average gradient across on GPU rank and 
+    # deposit it across the ranks
+    model = DDP(model, device_ids=[ddp_local_rank])
+raw_model = model.module if ddp else model
 
 # training loop
 # optimizer: AdamW is the bug fixes of Adam per doc from Kaparthy
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
-data_loader = DataLoaderLite(B, T)
+optimizer = raw_model.configure_optimizers(weigt_decay=0.1, learning_rate=6e-4, device=device) 
+train_loader = DataLoaderLite(B, T)
 # not sure if it's available on my old gpu --> so we wont get 8x speedup
 torch.set_float32_matmul_precision('high')
 import time
@@ -383,7 +421,7 @@ for step in range(max_steps):
     optimizer.zero_grad()
     loss_accum = 0.0
     for micro_step in range(grad_accum_steps):
-        x, y = data_loader.next_batch()
+        x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
         # train with bfloat16 on some parts of the calculations 
         with torch.autocast(device_type=device , dtype=torch.bfloat16):
@@ -394,7 +432,19 @@ for step in range(max_steps):
         # normalizer
         loss = loss / grad_accum_steps
         loss_accum += loss.detach()
+        # disable syncrhonization between GPUs for microstep here as it is wasteful
+        # we can wait until the gradient finish accumuated and then synchronize across GPUs
+        # little hacky that we only allow sync at last step
+        if ddp:
+            model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
         loss.backward()
+    # currently loss_accum only printed the local loss of master process
+    # we want loss_accum to be the average across all GPUS
+    if ddp:
+        # will create an average of loss_accum tensor across all the rank
+        # and deposit to loss_accum on each GPUs
+        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+    # HERE we have average gradient across GPUs 
     # follow GPT3 paper to clip the gradient to prevent shocking the model learning process with shooting gradient
     norm = torch.nn.utils.clip_grad_norm_(parameters=model.parameters(), max_norm=1.0)
     # determine and set learning rate 
@@ -407,7 +457,7 @@ for step in range(max_steps):
     torch.cuda.synchronize()
     t1 = time.monotonic()
     dt = t1 - t0
-    token_processed = data_loader.B * data_loader.T * grad_accum_steps
+    token_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
     tokens_per_sec = token_processed / dt
     #print(f"dt: {(t1 - t0)*1000}ms")
     # we want to see that we can crush this little batch 
@@ -421,7 +471,11 @@ for step in range(max_steps):
     # step 48, loss: 0.001992021454498172
     # step 49, loss: 0.0019393289694562554
     #if (i % 10) == 0:
-    print(f"step {step}, loss: {loss_accum.item():.6f} | norm: {norm:.4f} | dt: {dt*1000}ms | tok/sec: {tokens_per_sec}")
+    if master_process:
+        print(f"step {step}, loss: {loss_accum.item():.6f} | norm: {norm:.4f} | dt: {dt*1000}ms | tok/sec: {tokens_per_sec}")
+
+if ddp:
+    destroy_process_group()
 
 import sys; sys.exit(0)
 
