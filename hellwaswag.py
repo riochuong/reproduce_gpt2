@@ -73,6 +73,7 @@ def download(split):
     data_filename = os.path.join(DATA_CACHE_DIR, f"hellaswag_{split}.json")
     if not os.path.exists(data_filename):
         print(f"Downloading {data_url} ")
+        download_file(data_url, data_filename)
 
 def render_example(example):
     """

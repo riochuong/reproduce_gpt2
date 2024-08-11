@@ -47,8 +47,8 @@ class CausalSelfAttention(nn.Module):
        self.n_head = config.n_head
        self.n_embd = config.n_embd
        # not really a bias but more of a mask, but following the OpenAI/HF naming though
-       self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                    .view(1, 1, config.block_size, config.block_size))
+       #self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+       #                             .view(1, 1, config.block_size, config.block_size))
 
     def forward(self, x):
        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -66,7 +66,7 @@ class CausalSelfAttention(nn.Module):
     #    att = F.softmax(att, dim=-1)
     #    y = att @ v
        # FLASH ATTENTION -- (torch.compile cannot find these to optimize just yet)
-       y = F.scaled_dot_product_attention(q, k, v, is_causual=True)
+       y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
 
        # make tensor layout in contiguous memory ??? 
@@ -141,7 +141,7 @@ class GPT(nn.Module):
         # apply will call self._init_weights on all of module that is part of GPT
         self.apply(self._init_weights)
     
-    def configure_optimizers(self, weight_decay, learning_rate, device):
+    def configure_optimizers(self, weight_decay, learning_rate, device_type):
         # separate into groups that should have weight_decay and should not have weight_decay
         # mostly decay weight that participate in matmul and embeddings
         param_dict = {pn: p for pn, p in self.named_parameters()}
@@ -161,7 +161,7 @@ class GPT(nn.Module):
 
         # Create AdamW optimizer 
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and 'cuda' in device
+        use_fused = fused_available and 'cuda' in device_type
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
         return optimizer
 
@@ -278,6 +278,7 @@ def get_most_likely_row(tokens, mask, logits):
 
 def load_tokens(filename):
     npt = np.load(filename)
+    npt = npt.astype(np.int32) # convert uint16 to int32 before to long tensor
     ptt = torch.tensor(npt, dtype=torch.long)
     return ptt
 
@@ -364,8 +365,8 @@ if ddp:
     ddp_local_rank = int(os.environ['LOCAL_RANK'])
     # this is number of GPU 
     ddp_world_size = int(os.environ['WORLD_SIZE'])
-    device = f"cuda:{ddp_local_rank}"
-    torch.cuda.set_device(device)
+    device_type = f"cuda:{ddp_local_rank}"
+    torch.cuda.set_device(device_type)
     master_process = ddp_rank == 0 # this process will do logging, checkpointing
 
 else:
@@ -374,12 +375,12 @@ else:
     ddp_local_rank= 0
     ddp_world_size = 1
     master_process = True
-    device = "cpu"
+    device_type = "cpu"
     if torch.cuda.is_available():
-        device = "cuda"
+        device_type = "cuda"
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = "mps"
-    print(f"using device: {device}")
+        device_type = "mps"
+    print(f"using device: {device_type}")
 
 # NOTES: 
 # imagine there are 8 GPUS are running at the same time so we need to adjust BATCH, SIZE
@@ -400,12 +401,12 @@ if master_process:
 
 
 # attempt to auto detect the device
-device = "cpu"
+device_type = "cpu"
 if torch.cuda.is_available():
-    device = "cuda"
+    device_type = "cuda"
 elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    device = "mps"
-print(f"Using device: {device} ")
+    device_type = "mps"
+print(f"Using device: {device_type} ")
 
 num_return_sequences = 5
 max_length = 30
@@ -414,7 +415,7 @@ max_length = 30
 model = GPT(GPTConfig)
 print(f"Loaded GPT-2 !!! YAYYAYAYAY")
 model.eval()
-model.to(device)
+model.to(device_type)
 # NOT using compile for now so we can evaluate hellwaswag
 #model = torch.compile(model)
 if ddp:
@@ -427,7 +428,7 @@ raw_model = model.module if ddp else model
 
 # training loop
 # optimizer: AdamW is the bug fixes of Adam per doc from Kaparthy
-optimizer = raw_model.configure_optimizers(weigt_decay=0.1, learning_rate=6e-4, device=device) 
+optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type) 
 train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
 val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
 # not sure if it's available on my old gpu --> so we wont get 8x speedup
@@ -442,6 +443,9 @@ log_file = os.path.join(log_dir, f"log.txt")
 with open(log_file, "w") as f: # open for writing to clear the file
     pass
 
+
+# torchrun --standalone --nproc_per_node=8 gpt2_model.py
+
 for step in range(max_steps):
     t0 = time.time() 
     last_step = (step == max_steps - 1)
@@ -455,8 +459,8 @@ for step in range(max_steps):
             val_loss_steps = 20
             for _ in range(val_loss_steps):
                 x, y = val_loader.next_batch()
-                x, y = x.to(device), y.to(device)
-                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                x, y = x.to(device_type), y.to(device_type)
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
                     logits, loss = model(x, y)
                 loss = loss /val_loss_steps
                 val_loss_accum += loss
@@ -478,19 +482,19 @@ for step in range(max_steps):
                 continue
             # render example in to tokens 
             _, tokens, mask, label = render_example(example)
-            tokens = tokens.to(device)
-            mask = mask.to(device)
+            tokens = tokens.to(device_type)
+            mask = mask.to(device_type)
             # get logits 
             with torch.no_grad():
-                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
                     logits, loss = model(tokens)
                 pred_norm = get_most_likely_row(tokens, mask, logits)
             num_total += 1
             num_correct_norm += int(pred_norm == label)
         # reduce the stats across all processes
         if ddp:
-            num_total = torch.tensor(num_total, dtype=torch.long, device=device)
-            num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
+            num_total = torch.tensor(num_total, dtype=torch.long, device=device_type)
+            num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=device_type)
             dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
             dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
             num_total = num_total.item()
@@ -510,12 +514,12 @@ for step in range(max_steps):
         tokens = enc.encode("Hello, I'm a language model")
         tokens = torch.tensor(tokens, dtype=torch.long)
         tokens.unsqueeze(0).repeat(num_return_sequences, 1)
-        xgen = tokens.to(device)
-        sample_rng = torch.Generator(device=device)
+        xgen = tokens.to(device_type)
+        sample_rng = torch.Generator(device=device_type)
         sample_rng.manual_seed(42 + ddp_rank)
         while xgen.size(1) < max_length:
             with torch.no_grad():
-                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
                     logits, loss = model(xgen) # (B, T, vocab_sie)
                 # take the logit at the last position
                 logits = logits[:, -1, :] # (B, vocab_size)
@@ -543,9 +547,15 @@ for step in range(max_steps):
     loss_accum = 0.0
     for micro_step in range(grad_accum_steps):
         x, y = train_loader.next_batch()
-        x, y = x.to(device), y.to(device)
+        x, y = x.to(device_type), y.to(device_type)
+        # little hacky that we only allow sync at last step
+        # disable syncrhonization between GPUs for microstep here as it is wasteful
+        # we can wait until the gradient finish accumuated and then synchronize across GPUs
+        # NOTE: added after video, this field is also used by the forward pass.
+        if ddp:
+            model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
         # train with bfloat16 on some parts of the calculations 
-        with torch.autocast(device_type=device , dtype=torch.bfloat16):
+        with torch.autocast(device_type=device_type , dtype=torch.bfloat16):
             _, loss = model(x, y) 
         # keep deposit gradient for each of the batch here 
         # the F.crossentropy loss using the "reduction" by "mean" to calculate the loss 
@@ -553,11 +563,8 @@ for step in range(max_steps):
         # normalizer
         loss = loss / grad_accum_steps
         loss_accum += loss.detach()
-        # disable syncrhonization between GPUs for microstep here as it is wasteful
-        # we can wait until the gradient finish accumuated and then synchronize across GPUs
-        # little hacky that we only allow sync at last step
-        if ddp:
-            model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
+       
+        
         loss.backward()
     # currently loss_accum only printed the local loss of master process
     # we want loss_accum to be the average across all GPUS
@@ -575,7 +582,8 @@ for step in range(max_steps):
         param_group['lr'] = lr
     optimizer.step()
     # wait for gpu to execute all kernels/works before getting the time
-    torch.cuda.synchronize()
+    if device_type == 'cuda':
+        torch.cuda.synchronize()
     t1 = time.monotonic()
     dt = t1 - t0
     token_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
@@ -596,6 +604,17 @@ for step in range(max_steps):
         print(f"step {step}, loss: {loss_accum.item():.6f} | norm: {norm:.4f} | dt: {dt*1000}ms | tok/sec: {tokens_per_sec}")
         with open(log_file, "a") as f:
             f.write(f"{step} train {loss_accum}")
+        if step > 0 and (step % 5000 == 0 or last_step):
+            checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+            checkpoint = {
+                    'model': raw_model.state_dict(),
+                    'config': raw_model.config,
+                    'step': step,
+                    'val_loss': val_loss_accum.item()
+                }
+            # you might also want to add optimizer.state_dict() and
+            # rng seeds etc., if you wanted to more exactly resume training
+            torch.save(checkpoint, checkpoint_path)
 
 if ddp:
     destroy_process_group()

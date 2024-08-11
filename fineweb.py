@@ -26,7 +26,7 @@ fw = load_dataset("HuggingFaceFW/fineweb-edu", name=remote_name, split="train")
 
 # init the tokenizer 
 enc = tiktoken.get_encoding("gpt2")
-eot = enc._special_tokens['<endoftext|>'] # end of text token 
+eot = enc._special_tokens['<|endoftext|>'] # end of text token 
 
 def tokenize(doc):
     # tokenizes a single document and returens a numpy array of uint16 tokens
@@ -46,15 +46,15 @@ if __name__ == "__main__":
     with mp.Pool(nprocs) as pool:
         shard_index = 0
         # preallocate buffer to hold current shard
-        all_tokens_np = np.empty((shard_size,), dtype=np.unint16)
+        all_tokens_np = np.empty((shard_size,), dtype=np.uint16)
         token_count = 0
         progress_bar = None
         for tokens in pool.imap(tokenize, fw, chunksize=16):
             # is there enough space in the current shard for the new tookens.
             if token_count + len(tokens) < shard_size:
                 # simply append tokens to current shard
-                token_count += len(tokens)
                 all_tokens_np[token_count:token_count+len(tokens)] = tokens
+                token_count += len(tokens)
                 # update progress bar
                 if progress_bar is None:
                     progress_bar = tqdm(total=shard_size, unit="tokens", desc=f"Shard {shard_index}")
