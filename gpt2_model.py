@@ -17,8 +17,6 @@ class GPTConfig:
     n_head: int = 6 # number of heads 
     n_embd: int = 384 # embedding dims 
 
-
-
 class MLP(nn.Module):
     def __init__(self, config: GPTConfig):
         super().__init__()
@@ -447,11 +445,13 @@ with open(log_file, "w") as f: # open for writing to clear the file
 # torchrun --standalone --nproc_per_node=8 gpt2_model.py
 
 for step in range(max_steps):
+    if master_process:
+        print(f"Start step {step}")
     t0 = time.time() 
     last_step = (step == max_steps - 1)
 
     # once in a while evaluate validation loss
-    if step % 250 == 0:
+    if (step > 0) and  (step % 250 == 0):
         model.eval()
         val_loader.reset()
         with torch.no_grad():
@@ -472,7 +472,7 @@ for step in range(max_steps):
                     f.write(f"{step} val {val_loss_accum.item():.4f}\n")
     
     # once in a while evaluate hellaswag
-    if step % 250 == 0 or last_step:
+    if ((step > 0) and (step % 250 == 0)) or last_step:
         model.eval()
         num_correct_norm = 0
         num_total = 0
