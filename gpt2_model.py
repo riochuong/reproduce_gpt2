@@ -13,9 +13,9 @@ import tiktoken
 class GPTConfig:
     block_size: int = 1024 # max sequence length
     vocab_size: int = 50257 # number of tokens: 50,000 BPE merges + 256 bytes tokens + 1 <|end_of_line|>
-    n_layer: int = 6 # number of layers 
-    n_head: int = 6 # number of heads 
-    n_embd: int = 384 # embedding dims 
+    n_layer: int = 12 # number of layers 
+    n_head: int = 12 # number of heads 
+    n_embd: int = 768 # embedding dims 
 
 class MLP(nn.Module):
     def __init__(self, config: GPTConfig):
@@ -23,6 +23,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.gelu = nn.GELU(approximate="tanh") # GPT-2 paper use approximate version
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj.NANO_GPT_SCALE_INIT = 1
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -159,6 +160,8 @@ class GPT(nn.Module):
 
         # Create AdamW optimizer 
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        if master_process:
+            print(f"using fused AdamW: {use_fused}")
         use_fused = fused_available and 'cuda' in device_type
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
         return optimizer
@@ -199,7 +202,7 @@ class GPT(nn.Module):
             # need to flatten 3-dim x tensors into 2-dim (input) and 1-dim targets
             # x: (B, T, vocab_size) -> (B*T, vocab_size)
             # y: (B, T) ->  (B*T)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return logits, loss
     
     @classmethod
@@ -328,7 +331,7 @@ class DataLoaderLite:
 max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 715 # gpt papers mentions it warms up with 375e6 tokens / 2^19 (which is the batch_size) =  ~715 steps
-max_steps = 19073 # we have about 10^9 tokens and 10^9 / 2^19 = ~19073
+max_steps = 19073 * 4 # we have about 10^9 tokens and 10^9 / 2^19 = ~19073
 # learning rate with cosine decay ratio
 # TODO: steps through in ipynb to gain some intuition for this  function  
 def get_lr(it):
@@ -513,7 +516,7 @@ for step in range(max_steps):
         max_length = 32
         tokens = enc.encode("Hello, I'm a language model")
         tokens = torch.tensor(tokens, dtype=torch.long)
-        tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+        tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
         xgen = tokens.to(device_type)
         sample_rng = torch.Generator(device=device_type)
         sample_rng.manual_seed(42 + ddp_rank)
@@ -562,9 +565,7 @@ for step in range(max_steps):
         # therefore, we need to add the mean factor here. Need to recover the original 
         # normalizer
         loss = loss / grad_accum_steps
-        loss_accum += loss.detach()
-       
-        
+        loss_accum += loss.detach() 
         loss.backward()
     # currently loss_accum only printed the local loss of master process
     # we want loss_accum to be the average across all GPUS
@@ -584,7 +585,7 @@ for step in range(max_steps):
     # wait for gpu to execute all kernels/works before getting the time
     if device_type == 'cuda':
         torch.cuda.synchronize()
-    t1 = time.monotonic()
+    t1 = time.time()
     dt = t1 - t0
     token_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
     tokens_per_sec = token_processed / dt
@@ -601,9 +602,9 @@ for step in range(max_steps):
     # step 49, loss: 0.0019393289694562554
     #if (i % 10) == 0:
     if master_process:
-        print(f"step {step}, loss: {loss_accum.item():.6f} | norm: {norm:.4f} | dt: {dt*1000}ms | tok/sec: {tokens_per_sec}")
+        print(f"step {step} | lr: {lr} | loss: {loss_accum.item():.6f} | norm: {norm:.4f} | dt: {dt*1000}ms | tok/sec: {tokens_per_sec}")
         with open(log_file, "a") as f:
-            f.write(f"{step} train {loss_accum}")
+            f.write(f"{step} train {loss_accum}\n")
         if step > 0 and (step % 5000 == 0 or last_step):
             checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
             checkpoint = {
